@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 
 use crate::app::{App, Focus, Mode};
@@ -112,7 +112,7 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Preview Pane
+// Preview Pane  — renders as a white PDF "page" on a dark desktop
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_preview_pane(f: &mut Frame, app: &mut App, area: Rect) {
@@ -124,47 +124,183 @@ fn render_preview_pane(f: &mut Frame, app: &mut App, area: Rect) {
         THEME.border_inactive
     };
 
-    let source = app.text();
-    let text   = render_preview(&source, &app.file_type, app.export_status.as_ref());
-
-    let total_lines = text.lines.len() as u16;
-    // Clamp scroll
-    let inner_h = area.height.saturating_sub(2);
-    if app.preview_scroll + inner_h > total_lines {
-        app.preview_scroll = total_lines.saturating_sub(inner_h);
-    }
-
-    let block = Block::default()
+    // ── Outer window (dark desktop behind the page) ───────────────────────
+    let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .title(Line::from(vec![
             Span::raw(" "),
-            Span::styled("Preview", Style::default().fg(THEME.fg_dim).add_modifier(Modifier::BOLD)),
-            Span::raw(" "),
+            Span::styled(
+                "Preview",
+                Style::default()
+                    .fg(THEME.fg_dim)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ─── PDF View "),
         ]))
-        .style(Style::default().bg(THEME.bg));
+        .style(Style::default().bg(Color::Indexed(234))); // dark desktop
 
-    let para = Paragraph::new(text)
-        .block(block)
+    let desktop = outer_block.inner(area);
+    f.render_widget(outer_block, area);
+
+    // ── Page geometry: centred with margins to look like a document ───────
+    let h_margin: u16 = 2;
+    let v_margin: u16 = 1;
+    let page_w = desktop.width.saturating_sub(h_margin * 2);
+    let page_h = desktop.height.saturating_sub(v_margin * 2);
+    let page_area = Rect::new(
+        desktop.x + h_margin,
+        desktop.y + v_margin,
+        page_w,
+        page_h,
+    );
+
+    if page_area.width < 4 || page_area.height < 2 {
+        return;
+    }
+
+    // ── Drop shadow (one cell offset, dark grey) ──────────────────────────
+    let shadow_area = Rect::new(
+        page_area.x + 1,
+        page_area.y + 1,
+        page_area.width,
+        page_area.height,
+    );
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Indexed(240))),
+        shadow_area,
+    );
+
+    // ── Rendered content ──────────────────────────────────────────────────
+    let source = app.text();
+    let raw_text = render_preview(&source, &app.file_type, app.export_status.as_ref());
+
+    // Re-map text colors so they look good on the cream white page
+    let page_text = remap_for_white_page(raw_text);
+
+    let total_lines = page_text.lines.len() as u16;
+    let page_inner_h = page_h.saturating_sub(2); // minus top/bottom border
+    if app.preview_scroll + page_inner_h > total_lines {
+        app.preview_scroll = total_lines.saturating_sub(page_inner_h);
+    }
+
+    // ── White page block with inner padding ──────────────────────────────
+    // Cream-white (#FDFBF7) background + thin light border like a page edge
+    let page_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(
+            Style::default().fg(Color::Indexed(252)), // very light border
+        )
+        .padding(Padding::new(2, 2, 0, 0))            // left=2, right=2 margins
+        .style(Style::default().bg(Color::Rgb(253, 251, 247))); // warm cream white
+
+    let para = Paragraph::new(page_text)
+        .block(page_block)
+        .style(
+            Style::default()
+                .bg(Color::Rgb(253, 251, 247))
+                .fg(Color::Rgb(28, 28, 35)), // near-black text on cream
+        )
         .wrap(Wrap { trim: false })
         .scroll((app.preview_scroll, 0));
 
-    f.render_widget(para, area);
+    f.render_widget(para, page_area);
 
-    // Scrollbar
-    if total_lines > inner_h {
+    // ── Scrollbar inside the page ─────────────────────────────────────────
+    if total_lines > page_inner_h {
         let mut sb_state = ScrollbarState::new(total_lines as usize)
             .position(app.preview_scroll as usize);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("↑"))
-                .end_symbol(Some("↓")),
-            area.inner(Margin { vertical: 1, horizontal: 0 }),
+                .style(Style::default().fg(Color::Indexed(250)).bg(Color::Rgb(253, 251, 247)))
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█"),
+            page_area.inner(Margin { vertical: 1, horizontal: 0 }),
             &mut sb_state,
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Color remapping — adjust tui-markdown colors for a white page background
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn remap_for_white_page<'a>(text: ratatui::text::Text<'a>) -> ratatui::text::Text<'a> {
+    use ratatui::style::Color;
+
+    // Map terminal indexed colors designed for dark backgrounds to
+    // page-appropriate document colors.
+    let remap_color = |c: Color| -> Color {
+        match c {
+            // Default / reset → near-black
+            Color::Reset => Color::Rgb(28, 28, 35),
+
+            // Very light colors (almost invisible on white) → dark equivalents
+            Color::Indexed(n) if n >= 230 => Color::Rgb(60, 60, 80),
+            Color::White => Color::Rgb(28, 28, 35),
+
+            // Blues (headings) → ink blue (good on white)
+            Color::Blue | Color::LightBlue | Color::Indexed(111) | Color::Indexed(110) => {
+                Color::Rgb(30, 90, 180)
+            }
+
+            // Greens (code, success) → forest green
+            Color::Green | Color::LightGreen
+            | Color::Indexed(150) | Color::Indexed(41) => Color::Rgb(20, 120, 60),
+
+            // Cyans → teal
+            Color::Cyan | Color::LightCyan
+            | Color::Indexed(117) | Color::Indexed(73) => Color::Rgb(0, 130, 130),
+
+            // Reds (errors, keywords) → crimson
+            Color::Red | Color::LightRed | Color::Indexed(204) => Color::Rgb(180, 30, 50),
+
+            // Yellows/oranges (LaTeX headings) → deep amber
+            Color::Yellow | Color::LightYellow
+            | Color::Indexed(216) | Color::Indexed(222) | Color::Indexed(215) => {
+                Color::Rgb(180, 100, 10)
+            }
+
+            // Magentas (italics, purple) → indigo
+            Color::Magenta | Color::LightMagenta
+            | Color::Indexed(175) | Color::Indexed(183) => Color::Rgb(120, 40, 160),
+
+            // Dark grey / dim (comments, line nums) → medium grey on page
+            Color::Indexed(238..=243) => Color::Rgb(140, 140, 150),
+            Color::DarkGray => Color::Rgb(120, 120, 130),
+
+            // Everything else — keep as-is (already dark enough)
+            other => other,
+        }
+    };
+
+    let remapped_lines: Vec<ratatui::text::Line<'a>> = text
+        .lines
+        .into_iter()
+        .map(|line| {
+            let new_spans: Vec<ratatui::text::Span<'a>> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let mut style = span.style;
+                    if let Some(fg) = style.fg {
+                        style.fg = Some(remap_color(fg));
+                    }
+                    // Don't touch bg — let the page block's bg show through
+                    style.bg = None;
+                    ratatui::text::Span::styled(span.content, style)
+                })
+                .collect();
+            ratatui::text::Line::from(new_spans)
+        })
+        .collect();
+
+    ratatui::text::Text::from(remapped_lines)
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status Bar
