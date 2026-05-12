@@ -1,14 +1,28 @@
 [package]
-name = "LM"
-version = "0.1.0"
-edition = "2024"
+name = "lm"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "lm"
+path = "src/main.rs"
 
 [dependencies]
-
-# The "Engine" for the terminal UI
-ratatui = "0.26"
-# Handles keyboard inputs and terminal control
-crossterm = "0.27"
-# Helps us manage errors without the app crashing
+# Terminal UI framework (bundles crossterm re-export)
+ratatui = "0.30"
+# Error handling
 anyhow = "1.0"
-execute = "0.2"
+# Full-featured vim-modal text editor widget for ratatui
+ratatui-textarea = { version = "0.9", features = ["crossterm"] }
+# Markdown → ratatui Text renderer
+tui-markdown = "0.3"
+# Markdown parser (used under the hood by tui-markdown)
+pulldown-cmark = "0.12"
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

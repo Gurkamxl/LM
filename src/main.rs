@@ -1,247 +1,287 @@
+mod app;
+mod commands;
+mod editor;
+mod preview;
+mod theme;
+mod ui;
+
 use anyhow::Result;
-use crossterm::{
+use clap::Parser;
+// ratatui 0.30 bundles crossterm — always use ratatui's re-export
+// to ensure type compatibility with ratatui-textarea 0.9
+use ratatui::crossterm::{
     ExecutableCommand,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{prelude::*, widgets::*};
-use std::fs;
+use ratatui::prelude::*;
+use ratatui_textarea::{CursorMove, Input};
 use std::io::stdout;
 
-// 1. Define a Theme structure for the "LazyVim" look
-struct Theme {
-    background: Color,
-    gutter_fg: Color,
-    editor_border: Color,
-    status_normal: Color,
-    status_insert: Color,
-    status_command: Color,
-    syntax_header: Color,
-    syntax_latex: Color,
-    text: Color,
+use app::{App, Focus, Mode};
+use editor::{load_file, save_file, set_insert_cursor, set_normal_cursor};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "lm", about = "LazyVim-inspired Markdown/LaTeX CLI editor")]
+struct Cli {
+    /// File to open (optional — defaults to scratch.md)
+    file: Option<String>,
 }
 
-const TOKYO_NIGHT: Theme = Theme {
-    background: Color::Indexed(234),     // Very dark blue/black
-    gutter_fg: Color::Indexed(243),      // Grey
-    editor_border: Color::Indexed(67),   // Muted Blue
-    status_normal: Color::Indexed(110),  // Steel Blue
-    status_insert: Color::Indexed(150),  // Soft Green
-    status_command: Color::Indexed(175), // Pink/Magenta
-    syntax_header: Color::Indexed(216),  // Orange/Peach
-    syntax_latex: Color::Indexed(117),   // Sky Blue
-    text: Color::Indexed(253),           // Off-white
-};
-
-enum Mode {
-    Normal,
-    Insert,
-    Command,
-    Search, // New Mode
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Entry Point
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let filename = cli.file.unwrap_or_else(|| "scratch.md".to_string());
+
+    // Build initial app state
+    let mut app = App::new(filename);
+    load_file(&mut app)?;
+
+    // Apply initial cursor style (Normal mode)
+    set_normal_cursor(&mut app.textarea);
+
+    // Terminal setup
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let theme = TOKYO_NIGHT;
-    let mut mode = Mode::Normal;
-    let mut lines: Vec<String> = vec![String::new()];
-    let mut cursor_x = 0;
-    let mut cursor_y = 0;
-    let mut command_input = String::new();
-    let mut search_query = String::new();
+    let result = run_loop(&mut terminal, &mut app);
 
+    // Always clean up the terminal
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+
+    result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Event Loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
-                .split(f.size());
-
-            let editor_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(4), Constraint::Min(0)])
-                .split(chunks[0]);
-
-            // --- Gutter ---
-            let mut line_nums = String::new();
-            for i in 1..=lines.len() {
-                line_nums.push_str(&format!("{:3}\n", i));
-            }
-            f.render_widget(
-                Paragraph::new(line_nums).style(Style::default().fg(theme.gutter_fg)),
-                editor_chunks[0].inner(&Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-            );
-
-            // --- Syntax Highlighting ---
-            let mut display_text = Vec::new();
-            for line in &lines {
-                let style = if line.starts_with('#') {
-                    Style::default()
-                        .fg(theme.syntax_header)
-                        .add_modifier(Modifier::BOLD)
-                } else if line.starts_with('\\') {
-                    Style::default().fg(theme.syntax_latex)
-                } else {
-                    Style::default().fg(theme.text)
-                };
-                display_text.push(Line::from(Span::styled(line.as_str(), style)));
-            }
-
-            f.render_widget(
-                Paragraph::new(display_text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(theme.editor_border))
-                            .title(" Rust Editor "),
-                    )
-                    .style(Style::default().bg(theme.background)),
-                editor_chunks[1],
-            );
-
-            // --- Status/Search/Command Bar ---
-            let bar_style = Style::default().bg(Color::Indexed(235));
-            let bar_content = match mode {
-                Mode::Normal => Line::from(vec![
-                    Span::styled(
-                        " NORMAL ",
-                        Style::default()
-                            .bg(theme.status_normal)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(" | Pos: {},{}", cursor_y + 1, cursor_x)),
-                ]),
-                Mode::Insert => Line::from(vec![Span::styled(
-                    " INSERT ",
-                    Style::default()
-                        .bg(theme.status_insert)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Mode::Command => Line::from(format!(":{}", command_input)),
-                Mode::Search => Line::from(format!("/{}", search_query)),
-            };
-
-            f.render_widget(Paragraph::new(bar_content).style(bar_style), chunks[1]);
-
-            if let Mode::Insert = mode {
-                f.set_cursor(
-                    editor_chunks[1].x + cursor_x as u16 + 1,
-                    editor_chunks[1].y + cursor_y as u16 + 1,
-                );
-            }
-        })?;
+        terminal.draw(|f| ui::draw(f, app))?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match mode {
-                Mode::Normal => match key.code {
-                    KeyCode::Char('i') => mode = Mode::Insert,
-                    KeyCode::Char(':') => {
-                        mode = Mode::Command;
-                        command_input.clear();
-                    }
-                    KeyCode::Char('/') => {
-                        mode = Mode::Search;
-                        search_query.clear();
-                    }
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        if cursor_x > 0 {
-                            cursor_x -= 1
-                        }
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        if cursor_x < lines[cursor_y].len() {
-                            cursor_x += 1
-                        }
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if cursor_y < lines.len() - 1 {
-                            cursor_y += 1;
-                            cursor_x = cursor_x.min(lines[cursor_y].len());
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if cursor_y > 0 {
-                            cursor_y -= 1;
-                            cursor_x = cursor_x.min(lines[cursor_y].len());
-                        }
-                    }
-                    _ => {}
-                },
-                Mode::Insert => match key.code {
-                    KeyCode::Esc => mode = Mode::Normal,
-                    KeyCode::Char(c) => {
-                        lines[cursor_y].insert(cursor_x, c);
-                        cursor_x += 1;
-                    }
-                    KeyCode::Backspace => {
-                        if cursor_x > 0 {
-                            lines[cursor_y].remove(cursor_x - 1);
-                            cursor_x -= 1;
-                        } else if cursor_y > 0 {
-                            let cur = lines.remove(cursor_y);
-                            cursor_y -= 1;
-                            cursor_x = lines[cursor_y].len();
-                            lines[cursor_y].push_str(&cur);
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let rem = lines[cursor_y].split_off(cursor_x);
-                        lines.insert(cursor_y + 1, rem);
-                        cursor_y += 1;
-                        cursor_x = 0;
-                    }
-                    _ => {}
-                },
-                Mode::Search => match key.code {
-                    KeyCode::Esc => mode = Mode::Normal,
-                    KeyCode::Enter => {
-                        // Simple search: find the first line containing the query
-                        for (i, line) in lines.iter().enumerate() {
-                            if line.contains(&search_query) {
-                                cursor_y = i;
-                                cursor_x = line.find(&search_query).unwrap_or(0);
-                                break;
-                            }
-                        }
-                        mode = Mode::Normal;
-                    }
-                    KeyCode::Char(c) => search_query.push(c),
-                    KeyCode::Backspace => {
-                        search_query.pop();
-                    }
-                    _ => {}
-                },
-                Mode::Command => match key.code {
-                    KeyCode::Esc => mode = Mode::Normal,
-                    KeyCode::Enter => {
-                        if command_input == "w" {
-                            fs::write("work.md", lines.join("\n"))?;
-                        }
-                        mode = Mode::Normal;
-                    }
-                    KeyCode::Char(c) => command_input.push(c),
-                    KeyCode::Backspace => {
-                        command_input.pop();
-                    }
-                    _ => {}
-                },
+
+            match app.mode {
+                Mode::Normal  => handle_normal(app, key)?,
+                Mode::Insert  => handle_insert(app, key),
+                Mode::Command => handle_command_mode(app, key)?,
+                Mode::Visual  => handle_visual(app, key),
+            }
+
+            if app.should_quit {
+                break;
             }
         }
     }
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Normal Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn handle_normal(
+    app: &mut App,
+    key: ratatui::crossterm::event::KeyEvent,
+) -> Result<()> {
+    // Clear status message on any keypress
+    app.command_msg = None;
+
+    match key.code {
+        // ── Enter Insert mode ────────────────────────────────────────────
+        KeyCode::Char('i') => {
+            app.mode = Mode::Insert;
+            set_insert_cursor(&mut app.textarea);
+        }
+        KeyCode::Char('a') => {
+            app.mode = Mode::Insert;
+            set_insert_cursor(&mut app.textarea);
+            app.textarea.move_cursor(CursorMove::Forward);
+        }
+        KeyCode::Char('o') => {
+            app.mode = Mode::Insert;
+            set_insert_cursor(&mut app.textarea);
+            app.textarea.move_cursor(CursorMove::End);
+            app.textarea.insert_newline();
+        }
+        KeyCode::Char('O') => {
+            app.mode = Mode::Insert;
+            set_insert_cursor(&mut app.textarea);
+            app.textarea.move_cursor(CursorMove::Head);
+            app.textarea.insert_newline();
+            app.textarea.move_cursor(CursorMove::Up);
+        }
+
+        // ── Enter Command mode ────────────────────────────────────────────
+        KeyCode::Char(':') => {
+            app.mode = Mode::Command;
+            app.command_input.clear();
+        }
+
+        // ── Help overlay ──────────────────────────────────────────────────
+        KeyCode::Char('?') => {
+            app.show_help = !app.show_help;
+        }
+
+        // ── Focus toggle ──────────────────────────────────────────────────
+        KeyCode::Tab => {
+            app.focus = match app.focus {
+                Focus::Editor  => Focus::Preview,
+                Focus::Preview => Focus::Editor,
+            };
+        }
+
+        // ── Vim motions ───────────────────────────────────────────────────
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.textarea.move_cursor(CursorMove::Back);
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            app.textarea.move_cursor(CursorMove::Forward);
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.textarea.move_cursor(CursorMove::Down);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.textarea.move_cursor(CursorMove::Up);
+        }
+        KeyCode::Char('w') => {
+            app.textarea.move_cursor(CursorMove::WordForward);
+        }
+        KeyCode::Char('b') => {
+            app.textarea.move_cursor(CursorMove::WordBack);
+        }
+        KeyCode::Char('e') => {
+            app.textarea.move_cursor(CursorMove::WordEnd);
+        }
+        KeyCode::Char('0') | KeyCode::Home => {
+            app.textarea.move_cursor(CursorMove::Head);
+        }
+        KeyCode::Char('$') | KeyCode::End => {
+            app.textarea.move_cursor(CursorMove::End);
+        }
+        KeyCode::Char('g') => {
+            // gg — go to top
+            app.textarea.move_cursor(CursorMove::Top);
+        }
+        KeyCode::Char('G') => {
+            app.textarea.move_cursor(CursorMove::Bottom);
+        }
+
+        // ── Editing ───────────────────────────────────────────────────────
+        KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.textarea.undo();
+            app.modified = true;
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.textarea.redo();
+            app.modified = true;
+        }
+        // Scroll preview down
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.preview_scroll = app.preview_scroll.saturating_add(5);
+        }
+        // Scroll preview up
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.preview_scroll = app.preview_scroll.saturating_sub(5);
+        }
+        // Delete char under cursor (x)
+        KeyCode::Char('x') => {
+            app.textarea.delete_next_char();
+            app.modified = true;
+        }
+
+        // ── Quick PDF export ──────────────────────────────────────────────
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let _ = save_file(app);
+            commands::export_pdf(app);
+        }
+
+        _ => {}
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Insert Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn handle_insert(app: &mut App, key: ratatui::crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            set_normal_cursor(&mut app.textarea);
+            app.textarea.move_cursor(CursorMove::Back);
+        }
+        _ => {
+            // Wrap the crossterm KeyEvent in ratatui's event enum
+            let evt = ratatui::crossterm::event::Event::Key(key);
+            let input = Input::from(evt);
+            if app.textarea.input(input) {
+                app.modified = true;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn handle_command_mode(
+    app: &mut App,
+    key: ratatui::crossterm::event::KeyEvent,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            app.command_input.clear();
+        }
+        KeyCode::Enter => {
+            let cmd = app.command_input.clone();
+            app.command_input.clear();
+            app.mode = Mode::Normal;
+
+            let quit = commands::handle_command(app, &cmd)?;
+            if quit {
+                app.should_quit = true;
+            }
+        }
+        KeyCode::Backspace => {
+            app.command_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.command_input.push(c);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Visual Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn handle_visual(app: &mut App, key: ratatui::crossterm::event::KeyEvent) {
+    if key.code == KeyCode::Esc {
+        app.mode = Mode::Normal;
+        set_normal_cursor(&mut app.textarea);
+    } else {
+        let evt = ratatui::crossterm::event::Event::Key(key);
+        let input = Input::from(evt);
+        app.textarea.input(input);
+    }
 }
